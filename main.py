@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from multiprocessing import Pool, Lock
 import functools
+from tqdm import tqdm
+
+db_lock = Lock()
 
 # Set the seaborn style and font scale
 sns.set(font_scale=1.2)
@@ -168,11 +171,12 @@ Final Answer: [result]"""
 
     # Save the result to the database
     if not found:
-        cursor.execute('''
-            INSERT OR REPLACE INTO results (model, m, n, example_id, input, ground_truth, model_answer, is_correct, usage, model_output)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (model_name, m, n, example_id, f"{number1} * {number2}", ground_truth, model_answer, is_correct, usage_json, model_output))
-        conn.commit()
+        with db_lock:
+            cursor.execute('''
+                INSERT OR REPLACE INTO results (model, m, n, example_id, input, ground_truth, model_answer, is_correct, usage, model_output)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (model_name, m, n, example_id, f"{number1} * {number2}", ground_truth, model_answer, is_correct, usage_json, model_output))
+            conn.commit()
 
     # Rate limiting: 20 requests per minute per API key
     #time.sleep(3)  # Adjust this delay as needed based on your actual rate limits
@@ -207,7 +211,6 @@ all_models_accs = {model_name: defaultdict(lambda: defaultdict(float)) for model
 all_models_reasoning_tokens = {model_name: defaultdict(lambda: defaultdict(lambda: None)) for model_name in MODELS_TO_TEST}
 
 # Add this near the top of the file with other global variables
-db_lock = Lock()
 
 def process_mn_pair(args):
     model_name, m, n, example_id, datasets = args
@@ -242,20 +245,20 @@ def process_mn_pair(args):
     ground_truth = re.sub(r'\D', '', ground_truth)
 
     # Use the lock when checking/writing to database
-    with db_lock:
-        if False and example_exists(model_name, m, n, example_id):
-            cursor.execute('SELECT is_correct, usage FROM results WHERE model=? AND m=? AND n=? AND example_id=?',
-                           (model_name, m, n, example_id))
-            row = cursor.fetchone()
-            is_correct_example = row[0]
-            usage_json = row[1]
-            usage = json.loads(usage_json) if usage_json else {}
-        else:
-            result = process_example(model_name, m, n, example_id, number1, number2, ground_truth)
-            if result is None:
-                print(f"Failed to process example {example_id} for {m}x{n} on model {model_name}")
-                return None
-            is_correct_example, usage = result
+    
+    if False and example_exists(model_name, m, n, example_id):
+        cursor.execute('SELECT is_correct, usage FROM results WHERE model=? AND m=? AND n=? AND example_id=?',
+                        (model_name, m, n, example_id))
+        row = cursor.fetchone()
+        is_correct_example = row[0]
+        usage_json = row[1]
+        usage = json.loads(usage_json) if usage_json else {}
+    else:
+        result = process_example(model_name, m, n, example_id, number1, number2, ground_truth)
+        if result is None:
+            print(f"Failed to process example {example_id} for {m}x{n} on model {model_name}")
+            return None
+        is_correct_example, usage = result
 
     return {
         'model_name': model_name,
@@ -276,15 +279,19 @@ def process_example_id(example_id):
             for model_name in MODELS_TO_TEST:
                 work_items.append((model_name, m, n, example_id, datasets))
 
-    # Process work items in parallel
+    # Process work items in parallel with progress bar
     with Pool(10) as pool:
-        results = pool.map(process_mn_pair, work_items)
+        results = list(tqdm(
+            pool.imap(process_mn_pair, work_items),
+            total=len(work_items),
+            desc=f"Example {example_id}",
+            ncols=100
+        ))
     
     # Process results and update statistics
     for result in results:
         if result is None:
             continue
-        #import pdb; pdb.set_trace()
             
         model_name = result['model_name']
         m = result['m']
