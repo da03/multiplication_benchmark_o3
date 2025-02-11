@@ -319,7 +319,7 @@ def process_example_id(example_id):
             all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'][n] += 1
 
 # In the main loop over example indices, replace the nested loops with:
-max_examples = 10
+max_examples = 20
 for example_id in range(max_examples):
     process_example_id(example_id)
     
