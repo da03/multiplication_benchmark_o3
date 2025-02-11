@@ -164,7 +164,7 @@ Final Answer: [result]"""
         model_answer = re.sub(r'\D', '', model_answer)
 
     is_correct = (model_answer == ground_truth)
-    print (ground_truth, partial_words, model_name, is_correct)
+    #print (ground_truth, partial_words, model_name, is_correct)
 
     # Store the entire usage object
     usage_json = json.dumps(usage) if usage else None
