@@ -284,6 +284,7 @@ def process_example_id(example_id):
     for result in results:
         if result is None:
             continue
+        #import pdb; pdb.set_trace()
             
         model_name = result['model_name']
         m = result['m']
@@ -310,14 +311,15 @@ def process_example_id(example_id):
         else:
             reasoning_tokens = None
 
+        if 'reasoning_tokens_sum' not in all_models_reasoning_tokens[model_name][m]:
+            all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'] = defaultdict(float)
+            all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'] = defaultdict(int)
         if reasoning_tokens is not None:
-            if 'reasoning_tokens_sum' not in all_models_reasoning_tokens[model_name][m]:
-                all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'] = defaultdict(float)
-                all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'] = defaultdict(int)
             all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'][n] += reasoning_tokens
             all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'][n] += 1
 
 # In the main loop over example indices, replace the nested loops with:
+max_examples = 10
 for example_id in range(max_examples):
     process_example_id(example_id)
     
@@ -338,7 +340,6 @@ for example_id in range(max_examples):
                 else:
                     accuracy = None
                 accs[m][n] = accuracy
-
                 tokens_sum = all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'].get(n, 0)
                 tokens_count = all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'].get(n, 0)
                 if tokens_count > 0:
