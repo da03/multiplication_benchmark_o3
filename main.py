@@ -9,6 +9,8 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from multiprocessing import Pool, Lock
+import functools
 
 # Set the seaborn style and font scale
 sns.set(font_scale=1.2)
@@ -204,86 +206,121 @@ print(f"Loaded datasets for all (m, n). Maximum examples per dataset: {max_examp
 all_models_accs = {model_name: defaultdict(lambda: defaultdict(float)) for model_name in MODELS_TO_TEST}
 all_models_reasoning_tokens = {model_name: defaultdict(lambda: defaultdict(lambda: None)) for model_name in MODELS_TO_TEST}
 
-# Main loop over example indices
-for example_id in range(max_examples):
+# Add this near the top of the file with other global variables
+db_lock = Lock()
+
+def process_mn_pair(args):
+    model_name, m, n, example_id, datasets = args
+    
+    # Skip if dataset doesn't exist or example_id is out of range
+    if (m, n) not in datasets or example_id >= len(datasets[(m, n)]):
+        return None
+        
+    line = datasets[(m, n)][example_id]
+    line = line.strip()
+    if '||' not in line:
+        return None
+        
+    input_part, output_part = line.split('||')
+    input_part = input_part.strip()
+    output_part = output_part.strip()
+
+    # Process input
+    tokens = input_part.split('*')
+    if len(tokens) != 2:
+        return None
+    number1_s = tokens[0].strip()
+    number2_s = tokens[1].strip()
+
+    number1 = process_number(number1_s)
+    number2 = process_number(number2_s)
+
+    # Process output
+    output_tokens = output_part.split('####')
+    ground_truth_s = output_tokens[-1].strip()
+    ground_truth = process_number(ground_truth_s)
+    ground_truth = re.sub(r'\D', '', ground_truth)
+
+    # Use the lock when checking/writing to database
+    with db_lock:
+        if False and example_exists(model_name, m, n, example_id):
+            cursor.execute('SELECT is_correct, usage FROM results WHERE model=? AND m=? AND n=? AND example_id=?',
+                           (model_name, m, n, example_id))
+            row = cursor.fetchone()
+            is_correct_example = row[0]
+            usage_json = row[1]
+            usage = json.loads(usage_json) if usage_json else {}
+        else:
+            result = process_example(model_name, m, n, example_id, number1, number2, ground_truth)
+            if result is None:
+                print(f"Failed to process example {example_id} for {m}x{n} on model {model_name}")
+                return None
+            is_correct_example, usage = result
+
+    return {
+        'model_name': model_name,
+        'm': m,
+        'n': n,
+        'is_correct': is_correct_example,
+        'usage': usage
+    }
+
+# Replace the main processing loop with this
+def process_example_id(example_id):
     print(f"Processing example_id: {example_id}")
+    
+    # Create list of all work items
+    work_items = []
     for m in range(1, DDD):
         for n in range(1, DDD):
-            print (f'{m} X {n}')
-            # Check if dataset exists and has this example
-            if (m, n) not in datasets or example_id >= len(datasets[(m, n)]):
-                continue
-            line = datasets[(m, n)][example_id]
-            line = line.strip()
-            if '||' not in line:
-                continue  # Invalid format
-            input_part, output_part = line.split('||')
-            input_part = input_part.strip()
-            output_part = output_part.strip()
-
-            # Process input
-            tokens = input_part.split('*')
-            if len(tokens) != 2:
-                continue  # Invalid format
-            number1_s = tokens[0].strip()
-            number2_s = tokens[1].strip()
-
-            number1 = process_number(number1_s)
-            number2 = process_number(number2_s)
-
-            # Process output
-            # Ground truth: Remove any '####' and process the number
-            output_tokens = output_part.split('####')
-            ground_truth_s = output_tokens[-1].strip()
-            ground_truth = process_number(ground_truth_s)
-
-            # Remove any non-digit characters from ground truth
-            ground_truth = re.sub(r'\D', '', ground_truth)
-
             for model_name in MODELS_TO_TEST:
-                if False and example_exists(model_name, m, n, example_id):
-                    # Fetch the stored results
-                    cursor.execute('SELECT is_correct, usage FROM results WHERE model=? AND m=? AND n=? AND example_id=?',
-                                   (model_name, m, n, example_id))
-                    row = cursor.fetchone()
-                    is_correct_example = row[0]
-                    usage_json = row[1]
-                    usage = json.loads(usage_json) if usage_json else {}
-                else:
-                    # Process the example
-                    result = process_example(model_name, m, n, example_id, number1, number2, ground_truth)
-                    if result is None:
-                        print(f"Failed to process example {example_id} for {m}x{n} on model {model_name}")
-                        continue
-                    is_correct_example, usage = result
+                work_items.append((model_name, m, n, example_id, datasets))
 
-                # Update accuracy counts
-                # We use a simple averaging over examples processed so far
-                if 'total_examples' not in all_models_accs[model_name][m]:
-                    all_models_accs[model_name][m]['total_examples'] = defaultdict(int)
-                    all_models_accs[model_name][m]['correct_examples'] = defaultdict(int)
-                all_models_accs[model_name][m]['total_examples'][n] += 1
-                if is_correct_example:
-                    all_models_accs[model_name][m]['correct_examples'][n] += 1
+    # Process work items in parallel
+    with Pool(10) as pool:
+        results = pool.map(process_mn_pair, work_items)
+    
+    # Process results and update statistics
+    for result in results:
+        if result is None:
+            continue
+            
+        model_name = result['model_name']
+        m = result['m']
+        n = result['n']
+        is_correct_example = result['is_correct']
+        usage = result['usage']
 
-                # Update reasoning tokens if available
-                if usage:
-                    if 'completion_tokens_details' in usage and 'reasoning_tokens' in usage['completion_tokens_details']:
-                        reasoning_tokens = usage['completion_tokens_details']['reasoning_tokens']
-                    elif 'completion_tokens' in usage:
-                        reasoning_tokens = usage['completion_tokens']  # Fallback
-                    else:
-                        reasoning_tokens = None
-                else:
-                    reasoning_tokens = None
+        # Update accuracy counts
+        if 'total_examples' not in all_models_accs[model_name][m]:
+            all_models_accs[model_name][m]['total_examples'] = defaultdict(int)
+            all_models_accs[model_name][m]['correct_examples'] = defaultdict(int)
+        all_models_accs[model_name][m]['total_examples'][n] += 1
+        if is_correct_example:
+            all_models_accs[model_name][m]['correct_examples'][n] += 1
 
-                if 'reasoning_tokens_sum' not in all_models_reasoning_tokens[model_name][m]:
-                    all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'] = defaultdict(float)
-                    all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'] = defaultdict(int)
-                if reasoning_tokens is not None:
-                    all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'][n] += reasoning_tokens
-                    all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'][n] += 1
+        # Update reasoning tokens if available
+        if usage:
+            if 'completion_tokens_details' in usage and 'reasoning_tokens' in usage['completion_tokens_details']:
+                reasoning_tokens = usage['completion_tokens_details']['reasoning_tokens']
+            elif 'completion_tokens' in usage:
+                reasoning_tokens = usage['completion_tokens']
+            else:
+                reasoning_tokens = None
+        else:
+            reasoning_tokens = None
 
+        if reasoning_tokens is not None:
+            if 'reasoning_tokens_sum' not in all_models_reasoning_tokens[model_name][m]:
+                all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'] = defaultdict(float)
+                all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'] = defaultdict(int)
+            all_models_reasoning_tokens[model_name][m]['reasoning_tokens_sum'][n] += reasoning_tokens
+            all_models_reasoning_tokens[model_name][m]['reasoning_tokens_count'][n] += 1
+
+# In the main loop over example indices, replace the nested loops with:
+for example_id in range(max_examples):
+    process_example_id(example_id)
+    
     # After each example, update the heatmaps
     for model_name in MODELS_TO_TEST:
         accs = {}
